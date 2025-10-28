@@ -1,0 +1,1026 @@
+import gi
+import os
+import json
+import subprocess
+import webbrowser
+from pathlib import Path
+
+# Require versions for Gtk and Adw, and the GObject udev wrapper
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("GUdev", "1.0")
+from gi.repository import Gtk, Adw, GLib, Gio, Pango, GUdev, GObject 
+
+# --- Global Constants ---
+APP_ID = "com.antisos.DvdManager"
+# This path points to ~/.config/antisos-dvd-manager/dvds.json
+CONFIG_DIR = Path(GLib.get_user_config_dir()) / "antisos-dvd-manager"
+DATA_FILE = CONFIG_DIR / "dvds.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
+
+# --- NEW FIELDS ADDED: media_condition, packaging_condition ---
+DVD_DATA_STRUCTURE = [
+    "title", "device_path", "location", "year", "director", "status", 
+    "format", "edition", "cover_url", "region_code", "disc_count", 
+    "purchase_price", "purchase_date", "media_condition", "packaging_condition"
+] 
+
+CONDITION_OPTIONS = [
+    "M (Mint)", "NM (Near Mint)", "VG+ (Very Good Plus)", 
+    "VG (Very Good)", "G (Good)"
+]
+
+
+class DvdManagerApp(Adw.Application):
+    """
+    The main Libadwaita application for managing DVDs.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(application_id=APP_ID, **kwargs)
+        self.dvds = []
+        self.win = None
+        self.settings = {}
+        self.load_dvds()
+        self.load_settings()
+        self.udev_monitor_setup_done = False
+        self.default_player_combo = None 
+        self.toast_overlay = None 
+        
+        # State for filtering and searching
+        self.current_location_filter = "All Locations" 
+        self.location_dropdown = None
+        self.current_status_filter = "All Statuses" 
+        self.status_dropdown = None
+        self.search_entry = None 
+        
+        self.connect("activate", self.on_activate)
+
+    # --- Data Persistence ---
+
+    def load_dvds(self):
+        """Loads DVD data from the JSON file."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if DATA_FILE.exists():
+                with open(DATA_FILE, 'r') as f:
+                    loaded_dvds = json.load(f)
+                    self.dvds = self._sanitize_dvd_list(loaded_dvds)
+        except Exception as e:
+            print(f"Error loading DVD data: {e}")
+            self.dvds = []
+            
+    def _sanitize_dvd_list(self, dvds_list):
+        """Ensures all required fields exist for loaded DVD entries."""
+        def sanitize_dvd(dvd):
+            # --- FIX: Ensure 'title' and 'device_path' are defaulted for new entries ---
+            dvd.setdefault('title', '')
+            dvd.setdefault('device_path', '/dev/sr0') # Default common Linux DVD device
+            # --------------------------------------------------------------------------
+            
+            dvd.setdefault('location', 'N/A')
+            dvd.setdefault('year', '') 
+            dvd.setdefault('director', '') 
+            dvd.setdefault('status', 'In Collection') 
+            dvd.setdefault('format', 'DVD') 
+            dvd.setdefault('edition', 'Standard') 
+            dvd.setdefault('cover_url', '') 
+            
+            # --- NEW FIELDS SANITIZATION ---
+            dvd.setdefault('region_code', 'Unspecified')
+            dvd.setdefault('disc_count', '1')
+            dvd.setdefault('purchase_price', '')
+            dvd.setdefault('purchase_date', '')
+            dvd.setdefault('media_condition', CONDITION_OPTIONS[1]) # Default to NM
+            dvd.setdefault('packaging_condition', CONDITION_OPTIONS[1]) # Default to NM
+            # --- END NEW FIELDS ---
+            
+            return dvd
+        return [sanitize_dvd(dvd) for dvd in dvds_list]
+
+    def save_dvds(self):
+        """Saves DVD data to the JSON file."""
+        try:
+            with open(DATA_FILE, 'w') as f:
+                json.dump(self.dvds, f, indent=4)
+        except Exception as e:
+            print(f"Error saving DVD data: {e}")            
+
+    def load_settings(self):
+        """Loads application settings from the JSON file."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if SETTINGS_FILE.exists():
+                with open(SETTINGS_FILE, 'r') as f:
+                    self.settings = json.load(f)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            self.settings = {} 
+
+    def save_settings(self):
+        """Saves application settings to the JSON file."""
+        try:
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print(f"Error saving settings: {e}")
+            
+    # --- UDEV Monitor Setup (Dummy) ---
+    def setup_udev_monitor(self):
+        """Placeholder for actual UDEV setup logic."""
+        if self.udev_monitor_setup_done:
+            return
+        # print("Setting up UDEV monitor (placeholder)...")
+        self.udev_monitor_setup_done = True
+
+
+    # --- UI Setup ---
+
+    def on_activate(self, app):
+        """Activates the application and creates the main window."""
+        self.setup_udev_monitor()
+        self.win = self.create_main_window(app)
+        self.win.present()
+
+    def create_main_window(self, app):
+        """Constructs the main application window."""
+        win = Adw.ApplicationWindow.new(app)
+        win.set_default_size(800, 600)
+        win.set_title("Antisos DVD Manager")
+        
+        # --- DVD List Box Setup ---
+        self.dvd_list_box = Gtk.ListBox.new()
+        self.dvd_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.dvd_list_box.set_vexpand(True)
+        self.dvd_list_box.add_css_class("boxed-list")
+        
+        self.dvd_list_box.set_filter_func(self.dvd_filter_func)
+        
+        scrolled_window = Gtk.ScrolledWindow.new()
+        scrolled_window.set_child(self.dvd_list_box)
+        scrolled_window.set_vexpand(True)
+
+        # --- DVD List Page Header Bar ---
+        
+        # 1. Add DVD button
+        add_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
+        add_button.set_tooltip_text("Add a new DVD to the collection")
+        add_button.add_css_class("suggested-action")
+        add_button.connect("clicked", self.show_add_dvd_dialog)
+        
+        # 2. Search Entry for advanced filtering
+        self.search_entry = Gtk.SearchEntry.new()
+        self.search_entry.set_hexpand(True)
+        self.search_entry.set_placeholder_text("Search title, director, year, or edition...")
+        self.search_entry.connect("search-changed", lambda entry: self.dvd_list_box.invalidate_filter())
+        
+        # 3. Location Filter Dropdown
+        self.location_dropdown = Gtk.DropDown.new(None, None)
+        self.location_dropdown.set_hexpand(False)
+        self.location_dropdown.connect("notify::selected-item", self.on_location_filter_changed)
+        
+        location_filter_label = Gtk.Label.new("Location:")
+        location_filter_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
+        location_filter_box.append(location_filter_label)
+        location_filter_box.append(self.location_dropdown)
+        
+        # 4. Status Filter Dropdown
+        self.status_dropdown = Gtk.DropDown.new(None, None)
+        self.status_dropdown.set_hexpand(False)
+        self.status_dropdown.connect("notify::selected-item", self.on_status_filter_changed)
+
+        status_filter_label = Gtk.Label.new("Status:")
+        status_filter_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
+        status_filter_box.append(status_filter_label)
+        status_filter_box.append(self.status_dropdown)
+
+        # Combine filters into one container
+        filter_container = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 12)
+        filter_container.append(location_filter_box) 
+        filter_container.append(status_filter_box) 
+        
+        # 5. Export/Import Menu Button
+        menu_model = Gio.Menu.new()
+        menu_model.append("Export Collection...", "app.export")
+        menu_model.append("Import Collection...", "app.import")
+        
+        menu_button = Gtk.MenuButton.new()
+        menu_button.set_icon_name("document-send-receive-symbolic")
+        menu_button.set_menu_model(menu_model)
+        menu_button.set_tooltip_text("Export or Import Collection Data")
+        
+        # Add actions to the application
+        self._create_action("export", self.show_export_dialog)
+        self._create_action("import", self.show_import_dialog)
+
+
+        # 6. Local Header Bar for the DVD list page
+        list_toolbar_header = Adw.HeaderBar.new()
+        list_toolbar_header.set_title_widget(Adw.WindowTitle.new("DVD Collection", ""))
+        list_toolbar_header.pack_start(filter_container)
+        list_toolbar_header.pack_end(menu_button)
+        list_toolbar_header.pack_end(add_button)
+        
+        
+        # 7. Add search bar below the main header using a Box
+        search_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 12)
+        search_box.set_margin_start(12)
+        search_box.set_margin_end(12)
+        search_box.set_margin_top(12)
+        search_box.append(self.search_entry)
+
+        # 8. Combine Header, Search, and Content
+        content_box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0)
+        content_box.append(list_toolbar_header)
+        content_box.append(search_box)
+        content_box.append(scrolled_window)
+        
+        list_toolbar_view = Adw.ToolbarView.new()
+        list_toolbar_view.set_content(content_box)
+        
+        self.setup_dvd_list() 
+
+        # --- Settings Page ---
+        settings_page = Adw.PreferencesPage.new()
+        settings_page.set_title("Settings")
+        settings_group = Adw.PreferencesGroup.new()
+        settings_group.set_title("Player Configuration")
+        
+        def create_path_entry(player_name, default_path):
+            key = f"{player_name.lower()}_path"
+            path = self.settings.get(key, default_path) 
+
+            row = Adw.EntryRow.new()
+            row.set_title(f"{player_name} Path")
+            row.set_text(path)
+            row.set_show_apply_button(True)
+
+            def on_apply(r):
+                new_path = r.get_text()
+                self.settings[key] = new_path
+                self.save_settings()
+                self.show_toast(f"{player_name} path saved.")
+
+            row.connect("apply", on_apply)
+            settings_group.add(row)
+            return row
+            
+        create_path_entry("MPV", "/usr/bin/mpv")
+        create_path_entry("Eliza", "/usr/bin/eliza")
+        create_path_entry("VLC", "/usr/bin/vlc")
+        create_path_entry("Parole", "/usr/bin/parole")
+        create_path_entry("Xine", "/usr/bin/xine")
+
+        default_player_row = Adw.ActionRow.new()
+        default_player_row.set_title("Default Player")
+        player_options = ["MPV", "Eliza", "VLC", "Parole", "Xine"]
+        
+        player_model = Gtk.StringList.new(player_options)
+        default_player_combo = Gtk.DropDown.new(player_model, None)
+
+        default_player_name = self.settings.get("default_player", "MPV")
+        try:
+            default_player_index = player_options.index(default_player_name)
+        except ValueError:
+             default_player_index = 0
+             
+        default_player_combo.set_selected(default_player_index)
+        
+        default_player_row.add_suffix(default_player_combo)
+        self.default_player_combo = default_player_combo
+        
+        default_player_combo.connect("notify::selected-item", self.on_default_player_changed)
+        # set_activatable_widget is correct here for Adw.ActionRow with a suffix
+        default_player_row.set_activatable_widget(default_player_combo) 
+        settings_group.add(default_player_row)
+
+        settings_page.add(settings_group)
+        
+        # --- Stack and Split View ---
+        self.content_stack = Gtk.Stack.new()
+        self.content_stack.add_titled(list_toolbar_view, "dvds", "DVDs")
+        self.content_stack.add_titled(settings_page, "settings", "Settings")
+
+        navigation_stack_sidebar = Gtk.StackSidebar.new()
+        navigation_stack_sidebar.set_stack(self.content_stack)
+        
+        sidebar_page = Adw.NavigationPage.new(navigation_stack_sidebar, "Navigation")
+
+        split_view = Adw.NavigationSplitView.new()
+        split_view.set_sidebar(sidebar_page)
+        
+        main_content_page = Adw.NavigationPage.new(self.content_stack, "Content")
+        split_view.set_content(main_content_page)
+
+        # --- Toast Overlay Setup ---
+        self.toast_overlay = Adw.ToastOverlay.new()
+        self.toast_overlay.set_child(split_view)
+
+        win.set_content(self.toast_overlay)
+        return win
+        
+    def _create_action(self, name, callback):
+        """Helper to create a simple application action."""
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", callback)
+        self.add_action(action)
+
+    def on_default_player_changed(self, dropdown, pspec):
+        """Saves the selected default player in settings."""
+        selected_item = dropdown.get_selected_item()
+        if selected_item:
+            player_name = selected_item.get_string()
+            self.settings["default_player"] = player_name
+            self.save_settings()
+            self.show_toast(f"Default player set to {player_name}.")
+
+    # --- Data & List Management ---
+    
+    def get_unique_locations(self):
+        """Extracts all unique location names from the DVD list."""
+        locations = sorted(list(set(dvd.get('location', 'N/A') for dvd in self.dvds)))
+        return ["All Locations"] + locations
+
+    def get_unique_statuses(self):
+        """Defines and returns all possible status options."""
+        return ["All Statuses", "In Collection", "Wishlist", "On Loan"]
+
+    def update_location_filter_dropdown(self, force_update=False):
+        """Updates the model of the location filter dropdown."""
+        locations = self.get_unique_locations()
+        location_model = Gtk.StringList.new(locations)
+        
+        self.location_dropdown.set_model(location_model)
+        
+        try:
+            index = locations.index(self.current_location_filter)
+            self.location_dropdown.set_selected(index)
+        except ValueError:
+            self.current_location_filter = "All Locations"
+            self.location_dropdown.set_selected(0)
+            
+    def on_location_filter_changed(self, dropdown, pspec):
+        """Updates the location filter state and invalidates the list filter."""
+        selected_item = dropdown.get_selected_item()
+        if selected_item:
+            new_filter = selected_item.get_string() 
+            
+            if new_filter != self.current_location_filter:
+                self.current_location_filter = new_filter
+                self.dvd_list_box.invalidate_filter()
+                self.show_toast(f"Filtered by Location: {new_filter}")
+                
+    def update_status_filter_dropdown(self):
+        """Updates the model of the status filter dropdown."""
+        statuses = self.get_unique_statuses()
+        status_model = Gtk.StringList.new(statuses)
+        
+        self.status_dropdown.set_model(status_model)
+        
+        try:
+            index = statuses.index(self.current_status_filter)
+            self.status_dropdown.set_selected(index)
+        except ValueError:
+            self.current_status_filter = "All Statuses"
+            self.status_dropdown.set_selected(0)
+
+    def on_status_filter_changed(self, dropdown, pspec):
+        """Updates the status filter state and invalidates the list filter."""
+        selected_item = dropdown.get_selected_item()
+        if selected_item:
+            new_filter = selected_item.get_string()
+            
+            if new_filter != self.current_status_filter:
+                self.current_status_filter = new_filter
+                self.dvd_list_box.invalidate_filter()
+                self.show_toast(f"Filtered by Status: {new_filter}")
+
+
+    def setup_dvd_list(self):
+        """Populates the Gtk.ListBox with current DVD data and sets up filters."""
+        
+        # Clear the listbox and update both filter dropdowns
+        while row := self.dvd_list_box.get_row_at_index(0):
+            self.dvd_list_box.remove(row)
+            
+        self.update_location_filter_dropdown()
+        self.update_status_filter_dropdown()
+            
+        if not self.dvds:
+            empty_state = Adw.StatusPage.new()
+            empty_state.set_title("No DVDs Found")
+            empty_state.set_icon_name("media-optical-symbolic")
+            empty_state.set_description("Click the '+' button above to add your first DVD.")
+            # We add a hidden row to hold the status page so it can be filtered out
+            empty_row = Gtk.ListBoxRow.new() 
+            empty_row.set_child(empty_state)
+            self.dvd_list_box.append(empty_row)
+            return
+
+        for dvd in self.dvds:
+            row = self.create_dvd_row(dvd)
+            # Store the DVD data dictionary directly on the row for the filter function
+            row._dvd_data = dvd 
+            self.dvd_list_box.append(row)
+            
+    def dvd_filter_func(self, row):
+        """
+        The complex filter function for the Gtk.ListBox.
+        Checks location, status, and the text search term.
+        """
+        # If the row is not a DVD data row (e.g., the Adw.StatusPage holder), check if list is empty
+        if not hasattr(row, '_dvd_data'):
+            # Show the StatusPage only if the list of DVDs is empty
+            return not self.dvds 
+            
+        dvd = row._dvd_data
+        
+        # 1. Location Filter Check
+        location = dvd.get('location', 'N/A')
+        location_match = (self.current_location_filter == "All Locations" or 
+                          location == self.current_location_filter)
+                          
+        # 2. Status Filter Check
+        status = dvd.get('status', 'In Collection')
+        status_match = (self.current_status_filter == "All Statuses" or
+                        status == self.current_status_filter)
+
+        # 3. Text Search Check
+        search_term = self.search_entry.get_text().strip().lower()
+        text_match = True
+        if search_term:
+            # Check against title, director, year, and edition
+            search_pool = f"{dvd.get('title', '').lower()} "
+            search_pool += f"{dvd.get('director', '').lower()} "
+            search_pool += f"{dvd.get('year', '').lower()} "
+            search_pool += f"{dvd.get('edition', '').lower()}"
+            
+            text_match = search_term in search_pool
+            
+        # Show the row if ALL three filters match
+        return location_match and status_match and text_match
+        
+    def create_dvd_row(self, dvd):
+        """Creates a custom Adw.ActionRow for a DVD entry."""
+        row = Adw.ActionRow.new()
+        row.set_title(dvd['title'])
+        
+        # Extract metadata fields for display
+        status = dvd.get('status', 'In Collection')
+        location = dvd.get('location', 'N/A') 
+        year = dvd.get('year', 'N/A')
+        director = dvd.get('director', 'N/A')
+        
+        # Collector fields for display
+        format_type = dvd.get('format', 'DVD') 
+        edition = dvd.get('edition', 'Standard')
+        cover_url = dvd.get('cover_url', '')
+        
+        # --- NEW COLLECTOR DISPLAY FIELDS ---
+        region_code = dvd.get('region_code', 'Unspecified')
+        disc_count = dvd.get('disc_count', '1')
+        media_condition = dvd.get('media_condition', 'N/A')
+        packaging_condition = dvd.get('packaging_condition', 'N/A')
+        
+        # Subtitle: Now includes format, edition, region, disc count, and condition
+        subtitle = (
+            f"Format: {format_type} ({edition}) | "
+            f"Media: {media_condition} / Pkg: {packaging_condition} | "
+            f"Region: {region_code} | Discs: {disc_count}\n"
+            f"Location: {location} | Status: {status} | Directed by: {director} ({year})"
+        )
+        row.set_subtitle(subtitle)
+        
+        # --- Suffix Buttons/Icons ---
+        
+        # Cover Art Display (Gtk.Picture implementation with fix for set_uri)
+        if cover_url:
+            # Gtk.Picture is used to display images from URIs (local or remote)
+            cover_pic = Gtk.Picture.new()
+            
+            # Set fixed dimensions for a clean thumbnail view (64x96px is a common DVD aspect ratio)
+            cover_pic.set_size_request(64, 96) 
+            cover_pic.set_content_fit(Gtk.ContentFit.COVER)
+            
+            try:
+                cover_pic.set_uri(cover_url)
+            except AttributeError:
+                # Fallback: Use Gio.File and set_file, which handles the URI internally
+                try:
+                    gio_file = Gio.File.new_for_uri(cover_url)
+                    cover_pic.set_file(gio_file)
+                except Exception as e:
+                    print(f"Error loading cover art via fallback: {e}")
+                    self.show_toast("Failed to load cover art via URI.", is_error=True)
+                    cover_pic.set_filename(None)
+            
+            cover_pic.set_tooltip_text(f"Cover Art (Click to open URL: {cover_url})")
+            
+            # Make the picture clickable to open the URL (useful if the thumbnail fails to load)
+            click_gesture = Gtk.GestureClick.new()
+            # Use GObject.closure_new to pass the URL correctly to the lambda
+            callback = lambda gesture, n_press, x, y: webbrowser.open(cover_url)
+            click_gesture.connect("released", callback)
+            cover_pic.add_controller(click_gesture)
+            
+            row.add_suffix(cover_pic)
+        
+        # Edit Button
+        edit_btn = Gtk.Button.new_from_icon_name("document-edit-symbolic")
+        edit_btn.set_tooltip_text(f"Edit '{dvd['title']}' details")
+        edit_btn.connect("clicked", self.show_edit_dvd_dialog, dvd)
+        row.add_suffix(edit_btn)
+        
+        # Delete Button
+        delete_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+        delete_btn.add_css_class("destructive-action")
+        delete_btn.set_tooltip_text(f"Delete '{dvd['title']}'")
+        delete_btn.connect("clicked", self.show_delete_dialog, dvd)
+        row.add_suffix(delete_btn)
+
+        # Play in Eliza Button
+        eliza_btn = Gtk.Button.new_with_label("Eliza")
+        eliza_btn.set_tooltip_text(f"Play in Eliza ({dvd['device_path']})")
+        eliza_btn.connect("clicked", self.on_play_dvd, dvd, "Eliza")
+        row.add_suffix(eliza_btn)
+
+        # Play in MPV Button
+        mpv_btn = Gtk.Button.new_with_label("MPV")
+        mpv_btn.add_css_class("suggested-action")
+        mpv_btn.set_tooltip_text(f"Play in MPV ({dvd['device_path']})")
+        mpv_btn.connect("clicked", self.on_play_dvd, dvd, "MPV")
+        row.add_suffix(mpv_btn)
+        
+        return row
+    
+    # --- Playback and Toast Logic ---
+
+    def on_play_dvd(self, button, dvd, player_name):
+        """Spawns an external media player process with the correct arguments."""
+        player_command = []
+        device_path = dvd['device_path']
+        
+        player_name_lower = player_name.lower()
+        player_path_key = f"{player_name_lower}_path"
+        executable = self.settings.get(player_path_key, player_name_lower)
+        
+        if player_name_lower == "mpv" or player_name_lower == "vlc" or player_name_lower == "xine":
+            # These players often need the dvd:// protocol
+            player_command = [executable, f"dvd://{device_path}"]
+        elif player_name_lower == "eliza" or player_name_lower == "parole":
+            # Other players might just need the device path
+            player_command = [executable, device_path] 
+
+        if not player_command:
+            print(f"Error: Unknown player {player_name}")
+            self.show_toast(f"Error: Unknown player {player_name}", True)
+            return
+
+        try:
+            GLib.spawn_async(
+                argv=player_command,
+                flags=GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD,
+                child_setup=None
+            )
+            print(f"Launched {player_name}: {' '.join(player_command)}")
+            self.show_toast(f"Launching {player_name} for '{dvd['title']}'...")
+            
+        except GLib.Error as e:
+            error_message = str(e).split(':')[-1].strip()
+            print(f"Failed to launch {player_name}: {e}")
+            self.show_toast(f"Launch Error: Could not execute '{executable}'. ({error_message})", True)
+
+    def show_toast(self, message, is_error=False):
+        """Displays a temporary, non-blocking toast notification."""
+        if not self.toast_overlay:
+            print("Error: Toast overlay not initialized.")
+            return
+            
+        toast = Adw.Toast.new(message)
+        
+        if is_error:
+            toast.set_timeout(5) 
+        else:
+            toast.set_timeout(3) 
+        
+        self.toast_overlay.add_toast(toast)
+        
+    def show_delete_dialog(self, button, dvd):
+        """Displays a confirmation dialog before deleting a DVD entry."""
+        title = dvd.get('title', 'Unknown DVD')
+        dialog = Adw.MessageDialog.new(
+            self.win,
+            "Confirm Deletion",
+            f"Are you sure you want to permanently delete '{title}' from your collection?"
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+
+        def on_response(d, response_id):
+            if response_id == "delete":
+                try:
+                    self.dvds.remove(dvd)
+                    self.save_dvds()
+                    self.setup_dvd_list()
+                    self.show_toast(f"'{title}' deleted.")
+                except ValueError:
+                    self.show_toast(f"Error: Could not find '{title}' to delete.", is_error=True)
+            d.close()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+
+
+    # --- EXPORT/IMPORT DIALOGS ---
+    
+    def show_export_dialog(self, action, param):
+        """Displays a dialog to select a path for exporting the DVD list."""
+        file_dialog = Gtk.FileDialog.new()
+        file_dialog.set_title("Export Collection to JSON")
+        
+        filter_json = Gtk.FileFilter.new()
+        filter_json.set_name("JSON Files")
+        filter_json.add_pattern("*.json")
+        
+        file_dialog.set_filters(Gio.ListStore.new(Gtk.FileFilter))
+        file_dialog.get_filters().append(filter_json)
+        
+        def on_save_finished(dialog, result):
+            try:
+                file = dialog.save_finish(result)
+                file_path = file.get_path()
+                if not file_path.lower().endswith(".json"):
+                    file_path += ".json"
+                    
+                with open(file_path, 'w') as f:
+                    json.dump(self.dvds, f, indent=4)
+                self.show_toast(f"Collection exported successfully to:\n{Path(file_path).name}")
+            except GLib.Error as e:
+                self.show_toast(f"Export cancelled or failed: {e.message}", is_error=True)
+            except Exception as e:
+                self.show_toast(f"An unexpected error occurred during export: {e}", is_error=True)
+
+        file_dialog.save(self.win, None, on_save_finished)
+
+    def show_import_dialog(self, action, param):
+        """Displays a dialog to select a JSON file for importing/merging."""
+        file_dialog = Gtk.FileDialog.new()
+        file_dialog.set_title("Import Collection from JSON")
+        
+        filter_json = Gtk.FileFilter.new()
+        filter_json.set_name("JSON Files (*.json)")
+        filter_json.add_pattern("*.json")
+        
+        file_dialog.set_filters(Gio.ListStore.new(Gtk.FileFilter))
+        file_dialog.get_filters().append(filter_json)
+
+        def on_open_finished(dialog, result):
+            try:
+                file = dialog.open_finish(result)
+                file_path = file.get_path()
+                
+                with open(file_path, 'r') as f:
+                    imported_dvds = json.load(f)
+                    
+                # Sanitize and merge the new data
+                imported_dvds = self._sanitize_dvd_list(imported_dvds)
+                
+                # Simple merging logic: just extend the list. 
+                self.dvds.extend(imported_dvds)
+                
+                self.save_dvds()
+                self.setup_dvd_list()
+                self.dvd_list_box.invalidate_filter()
+                
+                self.show_toast(f"Successfully imported {len(imported_dvds)} entries from {Path(file_path).name}.")
+
+            except GLib.Error as e:
+                self.show_toast(f"Import cancelled or failed: {e.message}", is_error=True)
+            except json.JSONDecodeError:
+                self.show_toast("Import failed: The file is not a valid JSON format.", is_error=True)
+            except Exception as e:
+                self.show_toast(f"An unexpected error occurred during import: {e}", is_error=True)
+
+        file_dialog.open(self.win, None, on_open_finished)
+        
+    # --- METADATA LOOKUP SIMULATION ---
+
+    def simulate_metadata_lookup(self, query):
+        """
+        Simulates an external API call to fetch media metadata based on title or UPC.
+        This uses hardcoded, local data only.
+        """
+        query = query.strip().lower()
+
+        # Simulated UPC/Barcode input
+        if query == "0883929452281": 
+            return {
+                "title": "Blade Runner 2049",
+                "director": "Denis Villeneuve",
+                "year": "2017",
+                "format": "4K UHD",
+                "edition": "Steelbook",
+                "region_code": "A, B, C",
+                "disc_count": "2",
+                "cover_url": "https://placehold.co/120x180/1c3d5a/ffffff?text=BR+2049",
+                "location": "Shelf 3",
+                "status": "In Collection",
+                "device_path": "/dev/sr0",
+                "media_condition": "NM (Near Mint)",
+                "packaging_condition": "M (Mint)",
+                "purchase_price": "29.99",
+                "purchase_date": "2024-05-15"
+            }
+        
+        # Simulated Title input
+        elif "interstellar" in query:
+            return {
+                "title": "Interstellar",
+                "director": "Christopher Nolan",
+                "year": "2014",
+                "format": "Blu-ray",
+                "edition": "Standard",
+                "region_code": "A",
+                "disc_count": "3",
+                "cover_url": "https://placehold.co/120x180/000000/ffffff?text=Interstellar",
+                "location": "Cabinet",
+                "status": "In Collection",
+                "device_path": "/dev/sr0",
+                "media_condition": "VG+ (Very Good Plus)",
+                "packaging_condition": "VG+ (Very Good Plus)",
+                "purchase_price": "14.99",
+                "purchase_date": "2023-11-01"
+            }
+
+        return None # Lookup failed
+
+    # --- ADD/EDIT DIALOGS (Combined) ---
+
+    def show_add_dvd_dialog(self, button):
+        """Wrapper to show the dialog for adding a new DVD."""
+        self._create_dvd_dialog(dvd_to_edit=None)
+
+    def show_edit_dvd_dialog(self, button, dvd):
+        """Wrapper to show the dialog for editing an existing DVD."""
+        self._create_dvd_dialog(dvd_to_edit=dvd)
+
+    def _create_dvd_dialog(self, dvd_to_edit=None):
+        """Displays the dialog to add or edit a DVD."""
+        is_editing = dvd_to_edit is not None
+        title = "Edit DVD Entry" if is_editing else "Add New DVD"
+        
+        # Use a copy of the existing data, or a new blank (sanitized) dictionary
+        data = dvd_to_edit.copy() if is_editing else self._sanitize_dvd_list([{}])[0]
+
+        dialog = Gtk.Dialog(
+            title=title,
+            transient_for=self.win,
+            modal=True
+        )
+
+        header_bar = Gtk.HeaderBar.new()
+        dialog.set_titlebar(header_bar)
+        
+        cancel_button = Gtk.Button.new_with_label("Cancel")
+        cancel_button.connect("clicked", lambda btn: dialog.response(Gtk.ResponseType.CANCEL))
+        header_bar.pack_start(cancel_button)
+        
+        save_label = "Save" if is_editing else "Add"
+        save_button = Gtk.Button.new_with_label(save_label)
+        save_button.add_css_class("suggested-action")
+        # Save button is disabled until title is entered
+        save_button.set_sensitive(data['title'].strip() != "")
+        
+        header_bar.pack_end(save_button)
+        
+        scrolled_window = Gtk.ScrolledWindow.new()
+        scrolled_window.set_vexpand(True)
+        
+        content_box = Gtk.Box.new(Gtk.Orientation.VERTICAL, 10)
+        content_box.set_margin_start(20)
+        content_box.set_margin_end(20)
+        content_box.set_margin_top(20)
+        content_box.set_margin_bottom(20)
+
+        # Dictionary to hold references to the UI widgets for data extraction
+        widgets = {} 
+        
+        # Helper function to create an entry row (COMPLETED IMPLEMENTATION)
+        def create_entry_row(key, title, placeholder="", is_title_input=False):
+            # Use Adw.EntryRow, which combines label and entry.
+            row = Adw.EntryRow.new()
+            row.set_title(title)
+            
+            # Properties are set directly on the row
+            row.set_text(placeholder)
+            row.set_text(str(data.get(key, '')))
+            
+            # Store reference
+            widgets[key] = row
+            return row
+            
+        # Helper function to create a dropdown row
+        def create_dropdown_row(key, title, options, default_value=None):
+            row = Adw.ActionRow.new()
+            row.set_title(title)
+
+            # Create a Gtk.StringList model from the options
+            model = Gtk.StringList.new(options)
+            dropdown = Gtk.DropDown.new(model, None)
+
+            # Set initial selection
+            current_value = default_value if default_value else data.get(key, options[0])
+            try:
+                index = options.index(current_value)
+            except ValueError:
+                index = 0
+            dropdown.set_selected(index)
+
+            # Store reference
+            widgets[key] = dropdown
+            row.add_suffix(dropdown)
+            row.set_activatable_widget(dropdown)
+            return row
+
+        # --- Lookup / Title Entry Area ---
+        
+        # A. Primary Title/Lookup Entry
+        lookup_entry = create_entry_row(
+            'title', 
+            "Title or ID", 
+            "e.g., Blade Runner 2049 or 0883929452281"
+        )
+        
+        # B. Lookup Button (to manually trigger the simulated metadata_lookup)
+        lookup_button = Gtk.Button.new_with_label("Lookup Local Data")
+        lookup_button.set_tooltip_text("Try to find metadata based on the title or ID above.")
+        lookup_button.add_css_class("flat")
+        
+        # Layout the title entry and lookup button
+        title_box = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6)
+        title_box.append(lookup_entry)
+        title_box.append(lookup_button)
+        
+        lookup_group = Adw.PreferencesGroup.new()
+        lookup_group.set_title("Search/Title")
+        lookup_group.set_description("Enter the title or ID to attempt a local lookup, or fill manually.")
+        lookup_group.add(title_box)
+        content_box.append(lookup_group)
+        
+        # C. Title change listener (to enable/disable Save button)
+        def on_title_changed(entry_row, pspec):
+            # Check the actual entry widget text, not the Adw.EntryRow object
+            text = entry_row.get_text()
+            save_button.set_sensitive(text.strip() != "")
+
+        lookup_entry.connect("notify::text", on_title_changed)
+
+
+        # --- General Details Group ---
+        general_group = Adw.PreferencesGroup.new()
+        general_group.set_title("General Details")
+        
+        general_group.add(create_entry_row('director', "Director", "e.g., Christopher Nolan"))
+        general_group.add(create_entry_row('year', "Year", "e.g., 2014"))
+        general_group.add(create_entry_row('device_path', "Device Path", "/dev/sr0 or /dev/dvd"))
+        
+        # Dropdowns
+        location_options = self.get_unique_locations()
+        # Remove "All Locations" from the list of options for setting a specific location
+        if "All Locations" in location_options:
+            location_options.remove("All Locations")
+        if not location_options:
+            location_options = ["Shelf 1", "Cabinet"] # Ensure at least two options exist
+            
+        status_options = self.get_unique_statuses()
+        if "All Statuses" in status_options:
+            status_options.remove("All Statuses")
+            
+        general_group.add(create_dropdown_row('location', "Storage Location", location_options))
+        general_group.add(create_dropdown_row('status', "Status", status_options))
+        
+        content_box.append(general_group)
+
+        # --- Collector Details Group ---
+        collector_group = Adw.PreferencesGroup.new()
+        collector_group.set_title("Collector Details")
+        
+        format_options = ["DVD", "Blu-ray", "4K UHD", "Digital", "VHS", "Other"]
+        collector_group.add(create_dropdown_row('format', "Format", format_options))
+        
+        edition_options = ["Standard", "Collector's", "Steelbook", "Limited", "Theatrical", "Unrated", "Other"]
+        collector_group.add(create_dropdown_row('edition', "Edition", edition_options))
+        
+        region_options = ["Unspecified", "A", "B", "C", "All"]
+        collector_group.add(create_dropdown_row('region_code', "Region Code", region_options))
+        
+        disc_count_options = [str(i) for i in range(1, 11)]
+        collector_group.add(create_dropdown_row('disc_count', "Disc Count", disc_count_options))
+
+        # Condition Fields
+        collector_group.add(create_dropdown_row('media_condition', "Media Condition (Disc)", CONDITION_OPTIONS))
+        collector_group.add(create_dropdown_row('packaging_condition', "Packaging Condition (Case)", CONDITION_OPTIONS))
+
+        # Financial/Purchase Fields
+        collector_group.add(create_entry_row('purchase_price', "Purchase Price", "e.g., 19.99"))
+        collector_group.add(create_entry_row('purchase_date', "Purchase Date", "YYYY-MM-DD"))
+        collector_group.add(create_entry_row('cover_url', "Cover Art URL", "http://example.com/cover.jpg"))
+
+        content_box.append(collector_group)
+        
+        # --- Lookup Logic Implementation ---
+        
+        def populate_fields_from_lookup(dvd_data):
+            """Updates all entry and dropdown widgets with data from a successful lookup."""
+            if not dvd_data:
+                self.show_toast("Local lookup failed. Please enter details manually.", is_error=True)
+                return
+
+            for key, widget in widgets.items():
+                if key in dvd_data:
+                    value = str(dvd_data[key])
+                    
+                    if isinstance(widget, Adw.EntryRow):
+                        widget.set_text(value)
+                    elif isinstance(widget, Gtk.DropDown):
+                        model = widget.get_model()
+                        found = False
+                        for i in range(model.get_n_items()):
+                            item = model.get_item(i)
+                            if item.get_string() == value:
+                                widget.set_selected(i)
+                                found = True
+                                break
+                        if not found:
+                             print(f"Warning: Looked up value '{value}' not found in dropdown for key '{key}'.")
+
+            self.show_toast(f"Metadata populated for: {dvd_data['title']}")
+
+        def on_lookup_clicked(button):
+            query = widgets['title'].get_text()
+            if not query:
+                self.show_toast("Please enter a title or ID first.", is_error=True)
+                return
+
+            # Call the simulated function
+            result = self.simulate_metadata_lookup(query)
+            populate_fields_from_lookup(result)
+
+        lookup_button.connect("clicked", on_lookup_clicked)
+
+        # --- Save/Add Logic Implementation ---
+        
+        def on_save_clicked(button):
+            new_data = {}
+            for key, widget in widgets.items():
+                if isinstance(widget, Adw.EntryRow):
+                    new_data[key] = widget.get_text().strip()
+                elif isinstance(widget, Gtk.DropDown):
+                    selected_item = widget.get_selected_item()
+                    if selected_item:
+                        new_data[key] = selected_item.get_string()
+                    else:
+                        new_data[key] = '' 
+
+            # Ensure 'title' is present
+            if not new_data.get('title', '').strip():
+                self.show_toast("Title cannot be empty.", is_error=True)
+                return
+
+            # Apply sanitation for mandatory fields that might be missing after manual entry
+            new_data = self._sanitize_dvd_list([new_data])[0]
+
+            if is_editing:
+                # Find the index of the original DVD and replace it
+                try:
+                    original_index = self.dvds.index(dvd_to_edit)
+                    self.dvds[original_index] = new_data
+                    self.show_toast(f"Updated '{new_data['title']}'")
+                except ValueError:
+                    # Should not happen if passed correctly
+                    self.show_toast("Error: Could not find original DVD to edit.", is_error=True)
+                    return
+            else:
+                # Add new DVD
+                self.dvds.append(new_data)
+                self.show_toast(f"Added '{new_data['title']}' to collection.")
+
+            # Save and refresh the list view
+            self.save_dvds()
+            self.setup_dvd_list() # Rebuilds the list and updates filters
+            dialog.close()
+
+        save_button.connect("clicked", on_save_clicked)
+
+        # --- Final Dialog Setup ---
+        scrolled_window.set_child(content_box)
+        dialog.set_child(scrolled_window)
+        dialog.set_default_size(500, 600)
+        dialog.present()
+
+
+# --- Application Entry Point ---
+if __name__ == "__main__":
+    app = DvdManagerApp()
+    app.run(None)

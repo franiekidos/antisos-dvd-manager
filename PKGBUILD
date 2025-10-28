@@ -32,5 +32,5 @@ build() {
 
 package() {
    install -Dm755 $srcdir/antisos-dvd-manager/dist/antisos-dvd-manager ${pkgdir}/usr/bin/antisos-dvd-manager
-   install -Dm755 $srcdir/antisos-dvd-manager/dist/antisos-dvd-manager.desktop ${pkgdir}/usr/share/applications/antisos-dvd-manager.desktop
+   install -Dm755 $srcdir/antisos-dvd-manager/antisos-dvd-manager.desktop ${pkgdir}/usr/share/applications/antisos-dvd-manager.desktop
 }

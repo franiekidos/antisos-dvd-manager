@@ -10,7 +10,7 @@ depends=(gtk4 python-vlc)
 # Use 'makedepends' for dependencies only needed to build the package (e.g., git, cmake, g++)
 makedepends=(pyinstaller)
 # List the source files, usually a tarball URL or a git repository
-source=("git+https://github.com/franiekidos/antisos-updater.git")
+source=("git+https://github.com/franiekidos/antisos-dvd-manager.git")
 # Optional: Add integrity checks for the source file
 sha256sums=(SKIP)
 
